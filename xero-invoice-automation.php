@@ -91,6 +91,15 @@ class Xero_Invoice_Webhook_Handler {
      * Check Xero for paid invoices and update WooCommerce orders
      */
     public function check_paid_invoices() {
+        // Respect any active rate-limit cooldown from a previous 429 response.
+        // Without this, repeated 429s keep Xero's penalty window alive and the
+        // integration never recovers on its own.
+        $cooldown_until = (int) get_option('xero_rate_limited_until', 0);
+        if ($cooldown_until > time()) {
+            $this->log_webhook_attempt('Skipping check - rate limited', '', '', false, 'Xero rate-limit cooldown active for ' . ($cooldown_until - time()) . ' more seconds');
+            return;
+        }
+
         $this->log_webhook_attempt('Starting scheduled Xero check', '', '', true, 'Checking invoices from last 90 days');
 
         // Get all pending payment orders from last 90 days
@@ -109,78 +118,122 @@ class Xero_Invoice_Webhook_Handler {
             return;
         }
 
-        $this->log_webhook_attempt('Found orders to check', '', '', true, 'Checking ' . count($orders) . ' orders');
-
-        // Check each order's invoice status in Xero
+        // Build a lookup of normalised Xero invoice ID => order, plus the list of
+        // IDs to query. We fetch all statuses in bulk below rather than making one
+        // API call per order (which is what was tripping Xero's rate limits).
+        $orders_by_invoice = array();
+        $invoice_ids = array();
         foreach ($orders as $order) {
-            $this->check_order_invoice_status($order);
+            $invoice_id = trim((string) $order->get_meta('_xero_invoice_id', true));
+            if ($invoice_id === '') {
+                continue;
+            }
+            $orders_by_invoice[strtolower($invoice_id)] = $order;
+            $invoice_ids[] = $invoice_id;
         }
 
-        $this->log_webhook_attempt('Completed scheduled Xero check', '', '', true, 'Finished checking ' . count($orders) . ' orders');
-    }
-
-    /**
-     * Check a single order's invoice status in Xero
-     */
-    private function check_order_invoice_status($order) {
-        $order_id = $order->get_id();
-        $invoice_id = $order->get_meta('_xero_invoice_id', true);
-
-        if (!$invoice_id) {
+        if (empty($invoice_ids)) {
+            $this->log_webhook_attempt('No invoice IDs found', '', '', true, 'Orders had no _xero_invoice_id values');
             return;
         }
 
-        try {
-            // Get invoice status from Xero
-            $invoice_status = $this->get_xero_invoice_status($invoice_id);
+        $this->log_webhook_attempt('Found orders to check', '', '', true, 'Checking ' . count($invoice_ids) . ' orders');
 
-            if (!$invoice_status) {
-                return;
+        $completed = 0;
+        $rate_limited = false;
+
+        // Chunk the IDs so each request stays well within Xero's limits and URL length.
+        foreach (array_chunk($invoice_ids, 50) as $chunk) {
+            $result = $this->get_xero_invoices_by_ids($chunk);
+
+            // Rate limited: honour Retry-After by storing a cooldown so this run AND
+            // the manual check stop calling Xero until it passes, then stop now.
+            if (!empty($result['rate_limited'])) {
+                $rate_limited = true;
+                $retry_after = (!empty($result['retry_after']) && $result['retry_after'] > 0) ? $result['retry_after'] : 900;
+                update_option('xero_rate_limited_until', time() + $retry_after);
+                $this->log_webhook_attempt('Xero rate limit hit - backing off', '', '', false, 'Pausing all Xero checks for ' . $retry_after . 's' . (!empty($result['problem']) ? ' (limit: ' . $result['problem'] . ')' : ''));
+                break;
             }
 
-            // Check if invoice is paid
-            if ($invoice_status === 'PAID') {
-                $invoice_number = $order->get_meta('_xero_invoice_number', true);
+            if (empty($result['ok'])) {
+                $this->log_webhook_attempt('Xero API error', '', '', false, isset($result['error']) ? $result['error'] : 'Unknown error');
+                break;
+            }
 
-                if (!$invoice_number) {
-                    // Generate it if missing
-                    $order_number = ltrim($order->get_order_number(), '#');
-                    $invoice_number = 'WebSales' . $order_number;
+            $invoices = (isset($result['data']['Invoices']) && is_array($result['data']['Invoices'])) ? $result['data']['Invoices'] : array();
+            foreach ($invoices as $invoice) {
+                if (!isset($invoice['InvoiceID'], $invoice['Status']) || $invoice['Status'] !== 'PAID') {
+                    continue;
                 }
 
-                // Mark order as completed
-                $order->update_status('completed', 'Order marked as completed - Xero invoice ' . $invoice_number . ' was paid.');
+                $key = strtolower(trim($invoice['InvoiceID']));
+                if (!isset($orders_by_invoice[$key])) {
+                    continue;
+                }
 
-                $this->log_webhook_attempt('Order completed via scheduled check', $invoice_number, $order_id, true, 'Invoice was paid in Xero');
+                $order = $orders_by_invoice[$key];
+                if ($order->get_status() === 'completed') {
+                    continue;
+                }
+
+                $invoice_number = $order->get_meta('_xero_invoice_number', true);
+                if (!$invoice_number) {
+                    $invoice_number = 'WebSales' . ltrim($order->get_order_number(), '#');
+                }
+
+                $order->update_status('completed', 'Order marked as completed - Xero invoice ' . $invoice_number . ' was paid.');
+                $this->log_webhook_attempt('Order completed via scheduled check', $invoice_number, $order->get_id(), true, 'Invoice was paid in Xero');
+                $completed++;
             }
-        } catch (Exception $e) {
-            $this->log_webhook_attempt('Error checking invoice', '', $order_id, false, $e->getMessage());
         }
+
+        // Clear any stale cooldown once we complete a clean run.
+        if (!$rate_limited) {
+            delete_option('xero_rate_limited_until');
+        }
+
+        $this->log_webhook_attempt('Completed scheduled Xero check', '', '', true, 'Checked ' . count($invoice_ids) . ' orders, completed ' . $completed);
     }
 
     /**
-     * Get invoice status from Xero API
+     * Fetch a batch of invoices from Xero by their IDs in a single API call.
+     *
+     * Returns the structured result from xero_api_get() so the caller can react
+     * to a 429 rate-limit response (and its Retry-After) rather than failing blind.
      */
-    private function get_xero_invoice_status($invoice_id) {
-        try {
-            // Get access token
-            $access_token = $this->get_valid_access_token();
+    private function get_xero_invoices_by_ids($invoice_ids) {
+        $ids = implode(',', array_map('rawurlencode', $invoice_ids));
+        $url = 'https://api.xero.com/api.xro/2.0/Invoices?IDs=' . $ids;
 
+        return $this->xero_api_get($url);
+    }
+
+    /**
+     * Make an authenticated GET request to the Xero API.
+     *
+     * Returns an array shaped:
+     *   ['ok' => bool, 'rate_limited' => bool, 'data' => array,
+     *    'retry_after' => int, 'problem' => string, 'error' => string]
+     *
+     * Refreshes the token and retries once on a 401, and surfaces 429 rate
+     * limiting (with the Retry-After / X-Rate-Limit-Problem headers) to the
+     * caller instead of silently returning false.
+     */
+    private function xero_api_get($url, $retry_on_auth = true) {
+        try {
+            $access_token = $this->get_valid_access_token();
             if (!$access_token) {
                 $this->log_webhook_attempt('No valid access token', '', '', false, 'Please connect to Xero in plugin settings');
-                return false;
+                return array('ok' => false, 'rate_limited' => false, 'error' => 'No valid access token');
             }
 
             $settings = $this->get_settings();
             $tenant_id = isset($settings['tenant_id']) ? $settings['tenant_id'] : '';
-
             if (empty($tenant_id)) {
                 $this->log_webhook_attempt('No tenant ID', '', '', false, 'Please reconnect to Xero');
-                return false;
+                return array('ok' => false, 'rate_limited' => false, 'error' => 'No tenant ID');
             }
-
-            // Make API request to get invoice
-            $url = 'https://api.xero.com/api.xro/2.0/Invoices/' . $invoice_id;
 
             $response = wp_remote_get($url, array(
                 'headers' => array(
@@ -192,39 +245,42 @@ class Xero_Invoice_Webhook_Handler {
             ));
 
             if (is_wp_error($response)) {
-                $this->log_webhook_attempt('Xero API request failed', '', '', false, $response->get_error_message());
-                return false;
+                return array('ok' => false, 'rate_limited' => false, 'error' => $response->get_error_message());
             }
 
             $status_code = wp_remote_retrieve_response_code($response);
             $body = wp_remote_retrieve_body($response);
 
-            if ($status_code !== 200) {
-                $error_detail = 'HTTP ' . $status_code;
-                if ($status_code === 401) {
-                    $error_detail .= ' (Unauthorized - reconnecting to Xero)';
-                    // Try to refresh token
-                    $this->refresh_access_token();
-                }
-                $error_data = json_decode($body, true);
-                if (isset($error_data['Detail'])) {
-                    $error_detail .= ': ' . $error_data['Detail'];
-                }
-
-                $this->log_webhook_attempt('Xero API error', '', '', false, $error_detail);
-                return false;
+            if ($status_code === 200) {
+                return array('ok' => true, 'rate_limited' => false, 'data' => json_decode($body, true));
             }
 
-            $data = json_decode($body, true);
-
-            if (isset($data['Invoices'][0]['Status'])) {
-                return $data['Invoices'][0]['Status'];
+            if ($status_code === 429) {
+                return array(
+                    'ok' => false,
+                    'rate_limited' => true,
+                    'retry_after' => (int) wp_remote_retrieve_header($response, 'retry-after'),
+                    'problem' => (string) wp_remote_retrieve_header($response, 'x-rate-limit-problem'),
+                    'error' => 'HTTP 429 (rate limited)',
+                );
             }
 
-            return false;
+            // Token rejected — refresh once and retry the request a single time.
+            if ($status_code === 401 && $retry_on_auth) {
+                if ($this->refresh_access_token()) {
+                    return $this->xero_api_get($url, false);
+                }
+                return array('ok' => false, 'rate_limited' => false, 'error' => 'HTTP 401 (token refresh failed)');
+            }
+
+            $error_detail = 'HTTP ' . $status_code;
+            $error_data = json_decode($body, true);
+            if (isset($error_data['Detail'])) {
+                $error_detail .= ': ' . $error_data['Detail'];
+            }
+            return array('ok' => false, 'rate_limited' => false, 'error' => $error_detail);
         } catch (Exception $e) {
-            $this->log_webhook_attempt('Xero API exception', '', '', false, $e->getMessage());
-            return false;
+            return array('ok' => false, 'rate_limited' => false, 'error' => $e->getMessage());
         }
     }
 
@@ -980,4 +1036,5 @@ register_deactivation_hook(__FILE__, function () {
     if ($timestamp) {
         wp_unschedule_event($timestamp, 'xero_check_paid_invoices');
     }
+    delete_option('xero_rate_limited_until');
 });
